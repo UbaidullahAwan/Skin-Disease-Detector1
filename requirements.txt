@@ -1,0 +1,5 @@
+echo "streamlit
+numpy
+pillow
+scikit-learn
+scipy" > requirements.txt
