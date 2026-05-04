@@ -1,3 +1,5 @@
+cat > requirements.txt << 'EOF'
 streamlit
 numpy
 pillow
+EOF
