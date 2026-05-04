@@ -4,6 +4,9 @@ from PIL import Image
 import pickle
 import os
 import time
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+import glob
 
 # ══════════════════════════════════════════════════════════════
 #  PAGE CONFIG
@@ -16,94 +19,64 @@ st.set_page_config(
 )
 
 # ══════════════════════════════════════════════════════════════
-#  LOAD TRAINED MODEL (FIXED FOR STREAMLIT CLOUD)
+#  COMPLETE FEATURE EXTRACTION (48 FEATURES - MATCHES TRAINING)
 # ══════════════════════════════════════════════════════════════
 
 
-@st.cache_resource
-def load_model():
-    """Load the trained skin disease classifier from GitHub files"""
-    try:
-        # Check if model files exist in the current directory
-        if os.path.exists('skin_disease_model.pkl') and os.path.exists('label_encoder.pkl'):
-            with open('skin_disease_model.pkl', 'rb') as f:
-                clf = pickle.load(f)
-            with open('label_encoder.pkl', 'rb') as f:
-                encoder = pickle.load(f)
-            return clf, encoder
-        else:
-            st.error("❌ Model files not found on server!")
-            st.info(
-                "📌 Make sure skin_disease_model.pkl and label_encoder.pkl are in the app directory")
-            return None, None
-    except Exception as e:
-        st.error(f"❌ Error loading model: {str(e)}")
-        return None, None
-
-# ══════════════════════════════════════════════════════════════
-#  FEATURE EXTRACTION (MATCHES TRAINING)
-# ══════════════════════════════════════════════════════════════
-
-
-def extract_features_from_image(img):
-    """Extract the same features used in training"""
-    # Resize image
+def extract_complete_features(img):
+    """Extract all 48 features from an image (matches training)"""
     img_resized = img.resize((128, 128))
     img_array = np.array(img_resized) / 255.0
 
-    # RGB channels
     r_channel = img_array[:, :, 0]
     g_channel = img_array[:, :, 1]
     b_channel = img_array[:, :, 2]
 
     features = []
 
-    # 1. Color features
+    # 1. RGB means (3 features)
     features.append(np.mean(r_channel))
     features.append(np.mean(g_channel))
     features.append(np.mean(b_channel))
+
+    # 2. RGB standard deviations (3 features)
     features.append(np.std(r_channel))
     features.append(np.std(g_channel))
     features.append(np.std(b_channel))
 
-    # 2. Redness (r - g)
+    # 3. Redness (1 feature)
     redness = np.mean(r_channel - g_channel)
     features.append(max(0, redness))
 
-    # 3. Brightness
+    # 4. Brightness (1 feature)
     brightness = (np.mean(r_channel) + np.mean(g_channel) +
                   np.mean(b_channel)) / 3
     features.append(brightness)
 
-    # 4. Color variation
+    # 5. Color variation (1 feature)
     features.append(np.std(img_array))
 
-    # 5. Saturation
+    # 6. Saturation (1 feature)
     max_rgb = np.maximum(np.maximum(r_channel, g_channel), b_channel)
     min_rgb = np.minimum(np.minimum(r_channel, g_channel), b_channel)
     saturation = np.mean((max_rgb - min_rgb) / (max_rgb + 0.001))
     features.append(saturation)
 
-    # 6. Texture features (edge detection)
+    # 7. Horizontal edges (1 feature)
     gray = np.mean(img_array, axis=2)
     h_edges = np.abs(np.diff(gray, axis=1))
+    features.append(np.mean(h_edges) if h_edges.size > 0 else 0)
+
+    # 8. Vertical edges (1 feature)
     v_edges = np.abs(np.diff(gray, axis=0))
+    features.append(np.mean(v_edges) if v_edges.size > 0 else 0)
 
-    if h_edges.size > 0:
-        features.append(np.mean(h_edges))
-    else:
-        features.append(0)
-
-    if v_edges.size > 0:
-        features.append(np.mean(v_edges))
-    else:
-        features.append(0)
-
+    # 9. Total edge density (1 feature)
     total_edges = (np.mean(h_edges) if h_edges.size > 0 else 0) + \
                   (np.mean(v_edges) if v_edges.size > 0 else 0)
     features.append(total_edges / 2)
 
-    # 7. Asymmetry
+    # 10. Asymmetry features (3 features)
     h, w = gray.shape
     if h >= 2 and w >= 2:
         q1 = gray[:h//2, :w//2].mean()
@@ -119,7 +92,7 @@ def extract_features_from_image(img):
     else:
         features.extend([0, 0, 0])
 
-    # 8. Color histograms
+    # 11. Color histograms (30 features - 10 per channel)
     hist_r, _ = np.histogram(r_channel, bins=10, range=(0, 1))
     hist_g, _ = np.histogram(g_channel, bins=10, range=(0, 1))
     hist_b, _ = np.histogram(b_channel, bins=10, range=(0, 1))
@@ -128,32 +101,122 @@ def extract_features_from_image(img):
     features.extend(hist_g / len(g_channel.flatten()))
     features.extend(hist_b / len(b_channel.flatten()))
 
-    # 9. Texture uniformity
+    # 12. Texture uniformity (2 features)
     features.append(np.std(gray))
     features.append(np.mean(gray) - np.std(gray))
 
+    # Total: 3+3+1+1+1+1+1+1+1+3+30+2 = 48 features
     return np.array(features).reshape(1, -1)
+
+# ══════════════════════════════════════════════════════════════
+#  TRAIN MODEL FROM DATASET
+# ══════════════════════════════════════════════════════════════
+
+
+def extract_features_from_file(img_path):
+    """Extract features from an image file for training"""
+    try:
+        img = Image.open(img_path).convert('RGB')
+        return extract_complete_features(img).flatten()
+    except Exception as e:
+        return None
+
+
+def train_model_from_dataset(dataset_path="dataset"):
+    """Train model from dataset folder"""
+    X = []
+    y = []
+
+    if not os.path.exists(dataset_path):
+        return None, None
+
+    disease_folders = [f for f in os.listdir(dataset_path)
+                       if os.path.isdir(os.path.join(dataset_path, f))]
+
+    if len(disease_folders) == 0:
+        return None, None
+
+    st.info(
+        f"📂 Found {len(disease_folders)} disease categories. Loading images...")
+
+    for disease in disease_folders:
+        disease_path = os.path.join(dataset_path, disease)
+        image_files = glob.glob(os.path.join(disease_path, "*.jpg")) + \
+            glob.glob(os.path.join(disease_path, "*.png")) + \
+            glob.glob(os.path.join(disease_path, "*.jpeg"))
+
+        for img_path in image_files:
+            features = extract_features_from_file(img_path)
+            if features is not None and len(features) == 48:
+                X.append(features)
+                y.append(disease)
+
+    if len(X) == 0:
+        return None, None
+
+    X = np.array(X)
+    encoder = LabelEncoder()
+    y_encoded = encoder.fit_transform(y)
+
+    clf = RandomForestClassifier(n_estimators=100, random_state=42)
+    clf.fit(X, y_encoded)
+
+    return clf, encoder
+
+# ══════════════════════════════════════════════════════════════
+#  LOAD OR TRAIN MODEL
+# ══════════════════════════════════════════════════════════════
+
+
+@st.cache_resource
+def load_or_train_model():
+    """Load existing model or train from dataset"""
+    # Try to load existing model first
+    if os.path.exists('skin_disease_model.pkl') and os.path.exists('label_encoder.pkl'):
+        try:
+            with open('skin_disease_model.pkl', 'rb') as f:
+                clf = pickle.load(f)
+            with open('label_encoder.pkl', 'rb') as f:
+                encoder = pickle.load(f)
+            return clf, encoder
+        except:
+            pass
+
+    # If no model or error, train from dataset
+    if os.path.exists('dataset'):
+        with st.spinner("🔄 Training AI model from dataset... This may take a minute."):
+            clf, encoder = train_model_from_dataset()
+            if clf:
+                # Save for next time
+                with open('skin_disease_model.pkl', 'wb') as f:
+                    pickle.dump(clf, f)
+                with open('label_encoder.pkl', 'wb') as f:
+                    pickle.dump(encoder, f)
+                st.success("✅ Model trained successfully!")
+                return clf, encoder
+
+    return None, None
 
 
 def predict_disease(img, clf, encoder):
-    """Predict skin disease using trained model"""
-    features = extract_features_from_image(img)
+    """Predict disease from image"""
+    features = extract_complete_features(img)
     prediction = clf.predict(features)[0]
     probabilities = clf.predict_proba(features)[0]
     confidence = np.max(probabilities)
     disease_name = encoder.inverse_transform([prediction])[0]
 
-    # Create probability dict
     probs = {}
     for i, disease in enumerate(encoder.classes_):
         probs[disease] = float(probabilities[i])
 
     return disease_name, confidence, probs
 
+# ══════════════════════════════════════════════════════════════
+#  THEMES AND DISEASE DATABASE
+# ══════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════
-#  THEMES
-# ══════════════════════════════════════════════════════════════
+
 THEMES = {
     "🌿 Skin Tone": {
         "bg": "linear-gradient(135deg,#f5e6d3 0%,#e8c9a0 30%,#d4a574 65%,#c8956c 100%)",
@@ -208,72 +271,69 @@ THEMES = {
     },
 }
 
-# ══════════════════════════════════════════════════════════════
-#  DISEASE DATABASE
-# ══════════════════════════════════════════════════════════════
 DISEASE_DB = {
     "Acne Vulgaris": {
         "emoji": "🔵", "severity": "Mild", "urgency": "Routine",
         "specialist": "Dermatologist",
-        "description": "A common skin condition causing pimples, blackheads, and whiteheads primarily on the face, chest, and back due to clogged hair follicles.",
-        "medications": ["Benzoyl Peroxide 2.5–5% wash", "Adapalene (Differin) 0.1% Gel", "Salicylic Acid Cleanser 2%", "Clindamycin Topical 1%"],
-        "recommendations": ["Wash face twice daily with gentle cleanser", "Never pop or squeeze pimples", "Use non-comedogenic sunscreen SPF 30+", "Change pillowcases twice a week", "See dermatologist if no improvement in 8 weeks"],
+        "description": "A common skin condition causing pimples, blackheads, and whiteheads primarily on the face, chest, and back.",
+        "medications": ["Benzoyl Peroxide 2.5–5% wash", "Adapalene (Differin) 0.1% Gel", "Salicylic Acid Cleanser 2%"],
+        "recommendations": ["Wash face twice daily", "Never pop pimples", "Use SPF 30+", "Change pillowcases weekly"],
     },
     "Psoriasis": {
         "emoji": "🟡", "severity": "Moderate", "urgency": "Soon",
         "specialist": "Dermatologist / Rheumatologist",
-        "description": "An autoimmune condition causing rapid skin cell buildup resulting in scaly silvery patches, redness, and inflammation — often cyclical with flare-ups.",
-        "medications": ["Topical Corticosteroids (Betamethasone)", "Vitamin D Analogue – Calcipotriol cream", "Coal Tar Shampoo/Ointment", "Methotrexate (severe – oral, by prescription)"],
-        "recommendations": ["Moisturize heavily with thick emollient creams", "Avoid triggers: stress, alcohol, smoking, infections", "Narrowband UVB phototherapy sessions", "Consult rheumatologist if joint pain present", "Avoid hot showers – use lukewarm water"],
+        "description": "An autoimmune condition causing rapid skin cell buildup resulting in scaly silvery patches, redness, and inflammation.",
+        "medications": ["Topical Corticosteroids", "Vitamin D Analogue cream", "Coal Tar Shampoo"],
+        "recommendations": ["Moisturize heavily", "Avoid stress and alcohol", "UVB phototherapy"],
     },
     "Melanoma": {
         "emoji": "⚫", "severity": "Critical", "urgency": "URGENT",
         "specialist": "Oncologist / Surgical Dermatologist",
-        "description": "A dangerous form of skin cancer arising from melanocytes. Early detection is life-saving. Signs include asymmetry, irregular borders, multiple colors, diameter >6mm, or evolving lesions.",
-        "medications": ["Pembrolizumab (Keytruda) – Immunotherapy", "Nivolumab (Opdivo) – PD-1 Inhibitor", "Dabrafenib + Trametinib – Targeted therapy", "Wide Local Excision – Surgical removal"],
-        "recommendations": ["⚠️ SEEK IMMEDIATE MEDICAL ATTENTION TODAY", "Do not delay – same-week oncologist appointment", "Biopsy and staging required urgently", "Avoid all UV exposure – use SPF 50+ always", "Inform family – increased genetic risk for relatives"],
+        "description": "A dangerous form of skin cancer. Early detection is life-saving. Look for asymmetry, irregular borders, multiple colors.",
+        "medications": ["Immunotherapy (Keytruda)", "Targeted therapy", "Surgical removal"],
+        "recommendations": ["⚠️ SEEK IMMEDIATE MEDICAL ATTENTION", "Biopsy required urgently", "Avoid UV exposure"],
     },
     "Impetigo": {
         "emoji": "🟤", "severity": "Mild-Moderate", "urgency": "Soon",
         "specialist": "Dermatologist / Pediatrician",
-        "description": "A highly contagious bacterial skin infection causing red sores and honey-colored crusts, most commonly affecting children.",
-        "medications": ["Mupirocin 2% topical cream", "Oral antibiotics (Cephalexin)", "Hibiclens antiseptic wash", "Topical retapamulin"],
-        "recommendations": ["Keep sores clean and covered", "Wash hands frequently", "Do not share towels, clothing, or bedding", "Avoid scratching – can spread infection", "Complete full course of antibiotics", "See doctor if fever or spreading rapidly"],
+        "description": "A highly contagious bacterial skin infection causing red sores and honey-colored crusts, most common in children.",
+        "medications": ["Mupirocin 2% topical cream", "Oral antibiotics (Cephalexin)", "Hibiclens antiseptic wash"],
+        "recommendations": ["Keep sores clean and covered", "Wash hands frequently", "Don't share towels"],
     },
     "Eczema (Atopic Dermatitis)": {
         "emoji": "🟠", "severity": "Mild–Moderate", "urgency": "Routine",
         "specialist": "Allergist / Dermatologist",
-        "description": "A chronic inflammatory skin condition causing dry, intensely itchy, and inflamed patches. Triggered by allergens, stress, irritants, or temperature changes.",
-        "medications": ["Hydrocortisone Cream 1% (OTC)", "Tacrolimus Ointment 0.1% (Protopic)", "Dupilumab (Dupixent) – for moderate-severe", "Cetirizine / Loratadine (antihistamine for itch)"],
-        "recommendations": ["Moisturize within 3 mins of bathing – lock in moisture", "Use fragrance-free, hypoallergenic detergent", "Identify and strictly avoid personal triggers", "Cool compresses on flare-ups for relief", "Wear soft, breathable cotton clothing"],
+        "description": "A chronic inflammatory skin condition causing dry, intensely itchy, and inflamed patches.",
+        "medications": ["Hydrocortisone Cream 1%", "Tacrolimus Ointment", "Antihistamines"],
+        "recommendations": ["Moisturize after bathing", "Use fragrance-free products", "Cool compresses for relief"],
     },
     "Ringworm (Tinea Corporis)": {
         "emoji": "🟢", "severity": "Mild", "urgency": "Routine",
         "specialist": "General Practitioner",
-        "description": "A highly contagious fungal infection causing circular, ring-shaped, scaly, reddish patches with clearer skin in the center.",
-        "medications": ["Clotrimazole Cream 1% (apply 2x daily × 4 weeks)", "Terbinafine (Lamisil) Cream 1%", "Miconazole Nitrate Cream 2%", "Oral Fluconazole 150mg (if extensive)"],
-        "recommendations": ["Apply antifungal cream for full 4 weeks – don't stop early", "Keep area clean and completely dry", "Avoid sharing towels, clothing, or sports equipment", "Wash all bedding and towels in hot water", "Avoid tight-fitting synthetic clothing"],
+        "description": "A highly contagious fungal infection causing circular, ring-shaped, scaly, reddish patches.",
+        "medications": ["Clotrimazole Cream 1%", "Terbinafine Cream", "Miconazole"],
+        "recommendations": ["Apply cream for 4 weeks", "Keep area dry", "Don't share towels"],
     },
     "Rosacea": {
         "emoji": "🩷", "severity": "Mild–Moderate", "urgency": "Routine",
         "specialist": "Dermatologist",
-        "description": "A chronic facial skin condition causing persistent redness, visible blood vessels (telangiectasia), and sometimes acne-like bumps. More common in fair-skinned individuals.",
-        "medications": ["Metronidazole Gel/Cream 0.75% (topical)", "Azelaic Acid 15% Gel (Finacea)", "Brimonidine Gel 0.33% (for redness)", "Doxycycline 40mg delayed-release (oral, by Rx)"],
-        "recommendations": ["Apply SPF 50+ mineral sunscreen daily", "Identify triggers: spicy foods, alcohol, hot drinks, sun", "Use only gentle, fragrance-free skincare products", "Consider vascular laser for persistent redness", "Avoid scrubbing or harsh exfoliants on face"],
+        "description": "A chronic facial skin condition causing persistent redness, visible blood vessels, and sometimes acne-like bumps.",
+        "medications": ["Metronidazole Gel", "Azelaic Acid 15%", "Doxycycline"],
+        "recommendations": ["SPF 50+ daily", "Avoid spicy food and alcohol", "Gentle skincare"],
     },
     "Basal Cell Carcinoma": {
         "emoji": "🔶", "severity": "Serious", "urgency": "Soon",
         "specialist": "Dermatologist / Oncologist",
-        "description": "The most common skin cancer, usually appearing as a pearly or waxy bump, flat lesion, or bleeding sore on sun-exposed skin. Rarely spreads but requires removal.",
-        "medications": ["Vismodegib (Erivedge) – for advanced/inoperable", "Imiquimod (Aldara) Cream 5% – superficial BCC", "5-Fluorouracil (Efudex) Cream – superficial", "Photodynamic Therapy (PDT) – clinic procedure"],
-        "recommendations": ["Book dermatologist appointment within 2 weeks", "Mohs micrographic surgery is gold-standard treatment", "Annual full-body skin checks after diagnosis", "Strict sun avoidance – wide-brim hat + SPF 50+", "Do not squeeze or pick at lesion"],
+        "description": "The most common skin cancer, usually appearing as a pearly or waxy bump on sun-exposed skin.",
+        "medications": ["Mohs surgery", "Imiquimod Cream", "Photodynamic Therapy"],
+        "recommendations": ["See dermatologist within 2 weeks", "Strict sun avoidance", "Annual skin checks"],
     },
     "Vitiligo": {
         "emoji": "⚪", "severity": "Mild", "urgency": "Routine",
         "specialist": "Dermatologist",
-        "description": "A condition where the immune system attacks melanocytes, causing loss of skin pigment in irregular white patches. Not contagious or life-threatening.",
-        "medications": ["Ruxolitinib Cream 1.5% (Opzelura) – FDA approved", "Tacrolimus Ointment 0.1% – face/sensitive areas", "Topical Corticosteroids (short-term only)", "Afamelanotide implant + NB-UVB combination"],
-        "recommendations": ["Apply SPF 50+ mineral sunscreen on all white patches", "Narrowband UVB phototherapy 3x/week", "Cosmetic camouflage for confidence", "Seek psychological support if impacting mental health", "Join vitiligo support community"],
+        "description": "A condition where the immune system attacks melanocytes, causing loss of skin pigment in irregular white patches.",
+        "medications": ["Ruxolitinib Cream", "Tacrolimus Ointment", "UVB phototherapy"],
+        "recommendations": ["SPF 50+ on white patches", "Cosmetic camouflage", "Support community"],
     },
 }
 
@@ -321,7 +381,6 @@ html, body, [class*="css"] {{ font-family:'Outfit',sans-serif !important; }}
     background-clip:text;
     line-height:1.2;
 }}
-
 .dsub {{
     color:{t['subtext']};
     font-size:.97rem;
@@ -422,10 +481,6 @@ def render_confidence(probs, t):
             unsafe_allow_html=True
         )
 
-# ══════════════════════════════════════════════════════════════
-#  SIDEBAR
-# ══════════════════════════════════════════════════════════════
-
 
 def render_sidebar(t):
     with st.sidebar:
@@ -463,7 +518,6 @@ def render_sidebar(t):
 
 
 def main():
-    # Initialize session state
     if "theme" not in st.session_state:
         st.session_state.theme = "🌿 Skin Tone"
     if "result" not in st.session_state:
@@ -473,33 +527,31 @@ def main():
     if "probs" not in st.session_state:
         st.session_state.probs = None
 
-    # Load theme
     t = THEMES[st.session_state.theme]
     inject_css(t)
 
-    # Sidebar
     theme_choice = render_sidebar(t)
     if theme_choice != st.session_state.theme:
         st.session_state.theme = theme_choice
         st.rerun()
 
-    # Header
     st.markdown("<div class='dtitle'>🔬 DermAI – Skin Disease Detector</div>",
                 unsafe_allow_html=True)
     st.markdown("<div class='dsub'>Upload a skin image · AI-powered diagnosis · Treatment recommendations</div>",
                 unsafe_allow_html=True)
 
-    # Load model
-    clf, encoder = load_model()
+    # Load or train model
+    clf, encoder = load_or_train_model()
 
     if clf is None:
+        st.error("❌ No model found and no dataset available to train.")
+        st.info(
+            "Please add a 'dataset' folder with disease subfolders containing skin images.")
         st.stop()
 
-    # Show model status
     st.success(
         f"✅ AI Model Ready! Trained on {len(encoder.classes_)} skin diseases")
 
-    # Layout
     col1, col2 = st.columns([1, 1.2])
 
     with col1:
@@ -544,7 +596,6 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # Results section
     if st.session_state.result:
         st.markdown("---")
         col_a, col_b, col_c = st.columns(3)
@@ -570,7 +621,6 @@ def main():
             render_confidence(st.session_state.probs, t)
             st.markdown("</div>", unsafe_allow_html=True)
 
-    # Footer
     st.markdown("""
     <div class='disclaim'>
     <i class='fas fa-exclamation-triangle'></i> <b>Medical Disclaimer:</b> For educational purposes only. 
