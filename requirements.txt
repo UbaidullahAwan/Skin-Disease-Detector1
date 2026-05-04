@@ -1,10 +1,3 @@
-cat > requirements.txt << 'EOF'
-streamlit==1.28.1
-numpy==1.24.3
-pillow==10.0.0
-scikit-learn==1.3.0
-EOF
-
-git add requirements.txt
-git commit -m "Use specific versions for all dependencies"
-git push origin main
+streamlit
+numpy
+pillow
