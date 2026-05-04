@@ -1,11 +1,8 @@
 import streamlit as st
 import numpy as np
 from PIL import Image
-import pickle
 import os
 import time
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.preprocessing import LabelEncoder
 import glob
 
 # ══════════════════════════════════════════════════════════════
